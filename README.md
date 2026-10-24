@@ -67,3 +67,19 @@ curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/products/limited-headphones
 pytest
 ```
+
+## Run with Docker
+
+Docker Compose starts the API and Redis together. Redis is present now so the
+next milestone can add atomic inventory reservations without changing the
+local environment.
+
+```bash
+docker compose up --build
+```
+
+Stop the services with:
+
+```bash
+docker compose down
+```
