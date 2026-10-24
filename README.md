@@ -79,9 +79,10 @@ curl -X POST http://127.0.0.1:8000/sales/limited-headphones/reservations \
 ```
 
 The endpoint returns `201` while stock remains and `409` when it is sold out.
-It currently uses a process-local lock only. The next milestone moves the
-atomic stock check and decrement to Redis, which is safe when API instances
-scale horizontally.
+The stock counter lives in Redis and is decremented by a Lua script, so the
+check-and-decrement is atomic even when multiple API instances receive traffic.
+If Redis is unavailable, the API returns `503` instead of risking an
+incorrect sale.
 
 ## Run with Docker
 

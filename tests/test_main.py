@@ -1,15 +1,37 @@
+from collections.abc import Iterator
+
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import INVENTORY, app, reset_in_memory_state
+from app.inventory import get_inventory_gateway
+from app.main import INITIAL_STOCK, app
 
 
 client = TestClient(app)
 
 
+class FakeInventoryGateway:
+    def __init__(self, stock: dict[str, int]) -> None:
+        self.stock = stock.copy()
+
+    def available_stock(self, product_id: str, initial_stock: int) -> int:
+        return self.stock.setdefault(product_id, initial_stock)
+
+    def reserve(self, product_id: str, initial_stock: int) -> int | None:
+        available_stock = self.available_stock(product_id, initial_stock)
+        if available_stock == 0:
+            return None
+        available_stock -= 1
+        self.stock[product_id] = available_stock
+        return available_stock
+
+
 @pytest.fixture(autouse=True)
-def reset_inventory() -> None:
-    reset_in_memory_state()
+def use_fake_inventory() -> Iterator[FakeInventoryGateway]:
+    inventory = FakeInventoryGateway(INITIAL_STOCK)
+    app.dependency_overrides[get_inventory_gateway] = lambda: inventory
+    yield inventory
+    app.dependency_overrides.clear()
 
 
 def test_health_check_returns_ok() -> None:
@@ -45,8 +67,10 @@ def test_reservation_decrements_available_stock() -> None:
     assert client.get("/products/limited-headphones").json()["available_stock"] == 99
 
 
-def test_reservation_returns_conflict_when_product_is_sold_out() -> None:
-    INVENTORY["limited-headphones"] = 0
+def test_reservation_returns_conflict_when_product_is_sold_out(
+    use_fake_inventory: FakeInventoryGateway,
+) -> None:
+    use_fake_inventory.stock["limited-headphones"] = 0
 
     response = client.post(
         "/sales/limited-headphones/reservations", json={"user_id": "user-123"}
