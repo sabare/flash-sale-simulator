@@ -84,6 +84,25 @@ These tests create and remove randomly named schemas in that database. They
 verify concurrent duplicate delivery, conflicting orders, and commit-before-ack
 redelivery using real PostgreSQL and emulated Redis.
 
+For real Redis integration tests, provide a Redis 7.4+ executable (or put
+`redis-server` on PATH). The tests launch their own processes on private Unix
+sockets with temporary data directories, using the repository's `redis.conf`.
+They do not connect to or flush your development Redis. Requires macOS or Linux.
+
+```bash
+TEST_REDIS_SERVER=/absolute/path/to/redis-server \
+TEST_DATABASE_URL='postgresql://user:password@localhost/test_database' \
+  .venv/bin/python -m pytest -q
+```
+
+Real-server tests check concurrent stock allocation, replay deduplication,
+shared rate limits, AOF reload, and worker recovery across a Redis restart with
+PostgreSQL order storage. An abrupt-exit test waits for disk sync with `WAITAOF`
+before killing its own Redis process; it does not assert zero loss for unsynced
+writes. Tests skip when their required executable/database is not configured.
+Verified locally: **36 passed with Redis 7.4.11 and PostgreSQL 18.3**. Compose uses
+PostgreSQL 17; container-level validation and load benchmarks are still pending.
+
 ## Current API
 
 Reserve one item with a user identifier:
@@ -182,8 +201,8 @@ a retry limit and dead-letter queue are still future work. Missing stream entrie
 are logged as errors because recovery cannot reconstruct deleted event data.
 
 The prototype targets a single Redis server and trusts caller-supplied user IDs.
-It has no authentication or crash-durability guarantee yet. Losing Redis state
-can lose both claims and events and cause stock to be reseeded. Lua prevents
+It has no authentication. AOF persistence is enabled as described below; losing
+the Redis data volume can still lose claims/events and cause stock to be reseeded. Lua prevents
 interleaving requests but does not provide rollback for runtime errors; the
 script validates stock and queue type before writing. See
 [Redis scripting documentation](https://redis.io/docs/latest/develop/programmability/eval-intro/).
@@ -223,8 +242,36 @@ Stop the services with:
 docker compose down
 ```
 
-This retains PostgreSQL's named volume. Redis persistence is not configured yet;
-recreating Redis can reset the sale while old orders remain in PostgreSQL.
+This retains both the `postgres_data` and `redis_data` named volumes. Keep the
+same Compose project name to reuse them. `docker compose down -v` removes these
+volumes and their data; do not use it for normal shutdown.
+
+## Redis persistence
+
+`redis.conf` enables append-only persistence with `appendfsync everysec`, stored
+in `/data` on the `redis_data` volume. Stock, user claims, idempotency responses,
+rate limits, stream events, and consumer-group pending state survive a normal
+restart. Keys with expiry still expire on schedule. `noeviction` prevents
+inventory keys from being silently evicted if a memory limit is introduced.
+
+Test a normal restart after making a reservation:
+
+```bash
+docker compose restart redis
+curl http://127.0.0.1:8000/products/limited-headphones
+```
+
+Stock should remain reduced, and retrying the original reservation with the same
+key should replay its response (subject to the rate limit). Requests during the
+restart may receive `503`. AOF's every-second sync can lose roughly one second
+of writes on an unplanned crash; this is not a zero-loss or high-availability
+design. Replication, backups, and database reconciliation remain future work.
+See [Redis persistence tradeoffs](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/).
+
+If upgrading an already-running pre-persistence demo, existing data in its old
+container is **not automatically migrated** to the new named volume. Preserve
+that data before recreating Redis if it matters; this configuration is for new
+demo runs and subsequent persistent restarts.
 
 Implementation references: [Redis consumer groups](https://redis.io/docs/latest/commands/xreadgroup/)
 [pending-event recovery](https://redis.io/docs/latest/commands/xautoclaim/),

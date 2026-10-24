@@ -1,36 +1,17 @@
 """Opt-in real PostgreSQL tests; each test owns a disposable isolated schema."""
 
-import os
 from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
 import fakeredis
 import psycopg
-from psycopg import sql
-from psycopg.conninfo import make_conninfo
 import pytest
 from fastapi.testclient import TestClient
 
 from app.inventory import RESERVATION_STREAM, RedisInventoryGateway
-from app.orders import PostgresOrderStore, ReservationEvent
+from app.orders import ReservationEvent
 from app.main import app, get_order_store
 from app.worker import ORDER_GROUP, RECLAIM_IDLE_MS, OrderWorker
-
-
-@pytest.fixture
-def store():
-    database_url = os.getenv("TEST_DATABASE_URL")
-    if not database_url:
-        pytest.skip("Set TEST_DATABASE_URL to run real PostgreSQL tests")
-    schema = f"test_orders_{uuid4().hex}"
-    with psycopg.connect(database_url, autocommit=True) as connection:
-        connection.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
-        try:
-            store = PostgresOrderStore(make_conninfo(database_url, options=f"-c search_path={schema}"))
-            store.initialize()
-            yield store
-        finally:
-            connection.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
 
 
 def test_concurrent_redelivery_creates_one_durable_order(store):

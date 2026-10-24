@@ -38,6 +38,10 @@ services:
 
   redis:
     image: redis:7.4-alpine
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    volumes:
+      - ./redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis_data:/data
     ports:
       - "6379:6379"
     healthcheck:
@@ -48,3 +52,4 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:
