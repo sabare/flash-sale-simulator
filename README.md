@@ -48,3 +48,22 @@ For a product, successful reservations must never exceed its configured stock.
 - Background order worker
 
 The exact application framework will be selected before milestone 1.
+
+## Run the first milestone
+
+This MVP uses Python 3.11+ and FastAPI.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload
+```
+
+In another terminal, verify the service:
+
+```bash
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/products/limited-headphones
+pytest
+```
