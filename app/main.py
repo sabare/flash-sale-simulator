@@ -1,4 +1,5 @@
-from uuid import uuid4
+import os
+from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
@@ -9,6 +10,7 @@ from app.inventory import (
     ReservationOutcome,
     get_inventory_gateway,
 )
+from app.orders import Order, OrderStoreUnavailableError, PostgresOrderStore
 
 
 app = FastAPI(
@@ -51,6 +53,28 @@ INITIAL_STOCK = {product_id: product.available_stock for product_id, product in 
 def health_check() -> dict[str, str]:
     """Return service status for load balancers and local checks."""
     return {"status": "ok"}
+
+
+def get_order_store() -> PostgresOrderStore:
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise HTTPException(status_code=503, detail="Order service unavailable")
+    return PostgresOrderStore(database_url)
+
+
+@app.get("/orders/{reservation_id}", response_model=Order)
+def get_order(
+    reservation_id: UUID,
+    store: PostgresOrderStore = Depends(get_order_store),
+) -> Order:
+    """Look up a persisted order; absent orders may still be queued."""
+    try:
+        order = store.get(reservation_id)
+    except OrderStoreUnavailableError:
+        raise HTTPException(status_code=503, detail="Order service unavailable")
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found; reservation may still be processing")
+    return order
 
 
 @app.get("/products/{product_id}", response_model=Product)

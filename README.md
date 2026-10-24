@@ -72,7 +72,7 @@ Run tests from the repository with `.venv/bin/python -m pytest -q`. API tests
 use a fake gateway; inventory tests execute the production Lua script using
 fakeredis with Lua support. No running Redis is needed for these tests. These
 checks do not replace real Redis integration tests or performance benchmarks.
-Worker tests also exercise database and acknowledgment failures. Three PostgreSQL
+Worker tests also exercise database and acknowledgment failures. Four PostgreSQL
 tests are skipped unless `TEST_DATABASE_URL` points to a disposable test database:
 
 ```bash
@@ -106,6 +106,21 @@ Replay records last 24 hours and are scoped to a product and user. After expiry,
 the user's permanent claim still blocks a second reservation.
 If Redis is unavailable, the API returns `503` instead of risking an
 incorrect sale.
+
+Look up the order using the `reservation_id` from the reservation response:
+
+```bash
+curl http://127.0.0.1:8000/orders/REPLACE_WITH_RESERVATION_UUID
+```
+
+`GET /orders/{reservation_id}` returns `200` with the reservation ID, product ID,
+user ID, status, and creation timestamp once the worker has saved the order.
+New orders have status `pending_payment`. A `404` means no order exists yet:
+the reservation may still be queued, or the ID may be unknown. After a successful
+reservation, wait briefly and retry; `404` alone does not prove sale failure.
+Malformed UUIDs return `422`; unavailable/unconfigured PostgreSQL returns `503`.
+On first startup, lookup may return `503` until the worker initializes the schema.
+This demo has no authentication; possession of a reservation UUID permits lookup.
 
 ## Reservation queue
 
@@ -157,8 +172,9 @@ script validates stock and queue type before writing. See
 ## Run with Docker
 
 Docker Compose starts the API, Redis, PostgreSQL, and the worker. The API uses
-Redis for stock, claims, replay responses, and queued reservation events. Only
-the worker connects to PostgreSQL; database writes stay outside the request path.
+Redis for stock, claims, replay responses, and queued reservation events. The
+worker writes orders, and the API reads them for status lookups; reservation
+requests do not access PostgreSQL.
 The bundled database credentials are for local development. PostgreSQL has no
 published host port, and its data lives in the named `postgres_data` volume.
 

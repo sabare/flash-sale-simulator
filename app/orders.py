@@ -1,11 +1,26 @@
 """Persist orders before acknowledging their source reservation events."""
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Mapping
+from typing import Literal, Mapping
 from uuid import UUID
 
 import psycopg
+from psycopg.rows import dict_row
+from pydantic import BaseModel
+
+
+class Order(BaseModel):
+    reservation_id: UUID
+    product_id: str
+    user_id: str
+    status: Literal["pending_payment", "paid", "cancelled"]
+    created_at: datetime
+
+
+class OrderStoreUnavailableError(Exception):
+    """Order storage cannot currently serve a lookup."""
 
 
 @dataclass(frozen=True)
@@ -36,6 +51,21 @@ class PostgresOrderStore:
             # Serialize first-time table creation if two workers start together.
             connection.execute("SELECT pg_advisory_xact_lock(724291)")
             connection.execute(Path(__file__).with_name("orders.sql").read_text())
+
+    def get(self, reservation_id: UUID) -> Order | None:
+        try:
+            with psycopg.connect(
+                self.database_url, connect_timeout=5, row_factory=dict_row,
+            ) as connection:
+                connection.execute("SET LOCAL statement_timeout = '5s'")
+                row = connection.execute(
+                    """SELECT reservation_id, product_id, user_id, status, created_at
+                       FROM orders WHERE reservation_id = %s""",
+                    (reservation_id,),
+                ).fetchone()
+        except psycopg.Error as error:
+            raise OrderStoreUnavailableError from error
+        return Order(**row) if row else None
 
     def save(self, event: ReservationEvent) -> None:
         # The context commits on successful exit; any error rolls back. Returning

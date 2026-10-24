@@ -5,6 +5,7 @@ services:
       - "8000:8000"
     environment:
       REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://flashsale:flashsale_dev@postgres:5432/flashsale
     depends_on:
       redis:
         condition: service_healthy
