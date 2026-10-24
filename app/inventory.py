@@ -12,7 +12,8 @@ from redis.exceptions import RedisError
 
 
 # The script checks the idempotency record, prevents duplicate user claims, and
-# decrements stock in one Redis operation. Codes 0 and 1 include a JSON payload
+# enqueues work and decrements stock in one Redis operation.
+# Codes 0 and 1 include a JSON payload
 # with the original reservation id and remaining stock.
 RESERVE_STOCK_SCRIPT = """
 local existing_reservation = redis.call('GET', KEYS[3])
@@ -26,9 +27,26 @@ local stock = redis.call('GET', KEYS[1])
 if not stock then
     return {-2, ''}
 end
-if tonumber(stock) <= 0 then
+-- Require a non-negative integer within Lua's exact integer range before XADD.
+local count = tonumber(stock)
+if not string.match(stock, '^%d+$') or not count or count > 9007199254740991 then
+    return {-2, ''}
+end
+if count == 0 then
     return {-1, ''}
 end
+-- Validate before writing: Redis scripts do not roll back on runtime errors.
+local queue_type = redis.call('TYPE', KEYS[4]).ok
+if queue_type ~= 'none' and queue_type ~= 'stream' then
+    return {-2, ''}
+end
+-- Append first so an XADD failure cannot consume inventory without an event.
+redis.call('XADD', KEYS[4], '*',
+    'event_type', 'reservation.created',
+    'schema_version', '1',
+    'reservation_id', ARGV[1],
+    'product_id', ARGV[3],
+    'user_id', ARGV[4])
 local remaining_stock = redis.call('DECR', KEYS[1])
 redis.call('SET', KEYS[2], 'claimed')
 local reservation = cjson.encode({
@@ -40,6 +58,7 @@ return {0, reservation}
 """
 
 IDEMPOTENCY_TTL_SECONDS = 86_400
+RESERVATION_STREAM = "flash-sale:reservations"
 
 
 class InventoryUnavailableError(Exception):
@@ -130,12 +149,15 @@ class RedisInventoryGateway:
         try:
             result_code, reservation_json = self.client.eval(
                 RESERVE_STOCK_SCRIPT,
-                3,
+                4,
                 stock_key,
                 claim_key,
                 idempotency_record_key,
+                RESERVATION_STREAM,
                 reservation_id,
                 IDEMPOTENCY_TTL_SECONDS,
+                product_id,
+                user_id,
             )
         except RedisError as error:
             raise InventoryUnavailableError from error
