@@ -1,6 +1,7 @@
 from collections.abc import Iterator
 
 import pytest
+import fakeredis
 from fastapi.testclient import TestClient
 
 from app.inventory import (
@@ -9,6 +10,7 @@ from app.inventory import (
     get_inventory_gateway,
 )
 from app.main import INITIAL_STOCK, app
+from app.rate_limit import RedisRateLimiter, get_rate_limiter
 
 
 client = TestClient(app)
@@ -66,8 +68,12 @@ class FakeInventoryGateway:
 def use_fake_inventory() -> Iterator[FakeInventoryGateway]:
     inventory = FakeInventoryGateway(INITIAL_STOCK)
     app.dependency_overrides[get_inventory_gateway] = lambda: inventory
-    yield inventory
-    app.dependency_overrides.clear()
+    with fakeredis.FakeRedis(decode_responses=True) as redis:
+        app.dependency_overrides[get_rate_limiter] = lambda: RedisRateLimiter(redis)
+        try:
+            yield inventory
+        finally:
+            app.dependency_overrides.clear()
 
 
 def test_health_check_returns_ok() -> None:

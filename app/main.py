@@ -11,6 +11,7 @@ from app.inventory import (
     get_inventory_gateway,
 )
 from app.orders import Order, OrderStoreUnavailableError, PostgresOrderStore
+from app.rate_limit import RateLimitUnavailableError, RedisRateLimiter, get_rate_limiter
 
 
 app = FastAPI(
@@ -106,10 +107,21 @@ def reserve_product(
         alias="Idempotency-Key", min_length=1, max_length=255
     ),
     inventory: InventoryGateway = Depends(get_inventory_gateway),
+    rate_limiter: RedisRateLimiter = Depends(get_rate_limiter),
 ) -> Reservation:
     """Reserve one product unit with Redis as the shared atomic stock gate."""
     if product_id not in PRODUCTS:
         raise HTTPException(status_code=404, detail="Product not found")
+
+    try:
+        retry_after = rate_limiter.check(request.user_id)
+    except RateLimitUnavailableError:
+        raise HTTPException(status_code=503, detail="Rate limit service unavailable")
+    if retry_after:
+        raise HTTPException(
+            status_code=429, detail="Too many reservation attempts",
+            headers={"Retry-After": str(retry_after)},
+        )
 
     try:
         reservation_result = inventory.reserve(

@@ -122,6 +122,25 @@ Malformed UUIDs return `422`; unavailable/unconfigured PostgreSQL returns `503`.
 On first startup, lookup may return `503` until the worker initializes the schema.
 This demo has no authentication; possession of a reservation UUID permits lookup.
 
+## Reservation rate limit
+
+Reservation requests for known products share a Redis-backed limit of **10
+attempts per user ID per 60 seconds**, across products and API instances. A
+fixed window begins with the first allowed attempt. Input validation and the
+product-existence check happen first; the rate limit runs before inventory access.
+Duplicate claims, sold-out attempts, and idempotent retries all consume budget.
+Requests above the limit receive `429` and a `Retry-After` header in seconds;
+rejections do not extend the window or change inventory/queued events.
+
+If throttled while retrying a reservation, wait as directed and reuse the same
+idempotency key. A rate-limit store failure returns `503` and does not proceed
+to the reservation. Read endpoints are not throttled in this milestone.
+
+The demo trusts the supplied user ID: changing it bypasses this per-user limit.
+Authentication, trusted-proxy/IP limits, and edge traffic protection are still
+needed for a public service. A fixed window also permits bursts around its
+boundary; this is not a global throughput or DDoS limit.
+
 ## Reservation queue
 
 Successful new reservations append a `reservation.created` event to the Redis
