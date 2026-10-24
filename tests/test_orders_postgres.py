@@ -12,7 +12,7 @@ import pytest
 
 from app.inventory import RESERVATION_STREAM, RedisInventoryGateway
 from app.orders import PostgresOrderStore, ReservationEvent
-from app.worker import ORDER_GROUP, OrderWorker
+from app.worker import ORDER_GROUP, RECLAIM_IDLE_MS, OrderWorker
 
 
 @pytest.fixture
@@ -66,7 +66,13 @@ def test_committed_order_can_be_redelivered_then_acknowledged(store):
         # Simulate a worker crash after committing but before XACK.
         store.save(ReservationEvent.from_fields(fields))
         assert redis.xpending(RESERVATION_STREAM, ORDER_GROUP)["pending"] == 1
-        worker.process(event_id, fields)
+        redis.xclaim(
+            RESERVATION_STREAM, ORDER_GROUP, "test-worker", 0, [event_id],
+            idle=RECLAIM_IDLE_MS + 1000,
+        )
+        replacement = OrderWorker(redis, store, "replacement-worker")
+        replacement.initialize()
+        assert replacement.run_once(block_ms=None) == 1
         assert redis.xpending(RESERVATION_STREAM, ORDER_GROUP)["pending"] == 0
         with psycopg.connect(store.database_url) as connection:
             assert connection.execute("SELECT reservation_id FROM orders").fetchall() == [(reservation_id,)]

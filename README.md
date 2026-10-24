@@ -131,10 +131,21 @@ A `201` API response confirms a reservation; order creation happens later. It
 does not indicate payment. The stream is intentionally untrimmed until we
 implement safe retention after processing.
 
-Failures are logged and left pending. **Automatic pending-event recovery is
-the next milestone:** this worker currently reads only new deliveries, so
-restarting it does not retry pending events. Malformed events also remain pending
-for inspection; retry policies and a dead-letter queue are not implemented yet.
+Failures are logged and left pending. Each worker loop first reclaims up to
+10 events idle for at least 60 seconds using `XAUTOCLAIM`, then reads new work.
+This recovers its own failed events and events owned by crashed workers. The
+pending-list scan cursor advances across loops so later entries are reached.
+Reclaiming resets the idle timer, spacing retries by at least the idle threshold.
+
+Configure `RECLAIM_IDLE_MS` on the worker to change the positive threshold in
+milliseconds. Choose a value longer than normal batch processing time: a slow
+live worker can otherwise overlap with a recovering worker. PostgreSQL's unique
+constraints make repeated order writes safe. Delivery can occur more than once;
+this does not promise exactly-once message delivery.
+
+Malformed or permanently failing events stay pending and retry at that interval;
+a retry limit and dead-letter queue are still future work. Missing stream entries
+are logged as errors because recovery cannot reconstruct deleted event data.
 
 The prototype targets a single Redis server and trusts caller-supplied user IDs.
 It has no authentication or crash-durability guarantee yet. Losing Redis state
@@ -181,4 +192,5 @@ This retains PostgreSQL's named volume. Redis persistence is not configured yet;
 recreating Redis can reset the sale while old orders remain in PostgreSQL.
 
 Implementation references: [Redis consumer groups](https://redis.io/docs/latest/commands/xreadgroup/)
+[pending-event recovery](https://redis.io/docs/latest/commands/xautoclaim/),
 and [Psycopg transactions](https://www.psycopg.org/psycopg3/docs/basic/usage.html).
