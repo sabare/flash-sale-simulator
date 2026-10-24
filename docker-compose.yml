@@ -9,6 +9,14 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=6)"]
+      interval: 5s
+      timeout: 7s
+      retries: 15
+      start_period: 10s
 
   worker:
     build: .

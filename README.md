@@ -1,278 +1,220 @@
 # Flash Sale Simulator
 
-A backend-focused simulation of a high-demand flash sale. The goal is to show
-how a system can accept a very large burst of purchase attempts while selling
-only the available inventory, without overwhelming its primary database.
+A backend project exploring how to reserve limited stock under concurrent
+purchase attempts, then create orders asynchronously. Built with **FastAPI,
+Redis Lua/Streams, and PostgreSQL**.
 
-## The problem
+The MVP includes atomic stock checks, one reservation per user/product,
+idempotent retries, rate limiting, persistent Redis state, a recovering order
+worker, order lookup, Prometheus metrics, and reproducible load tests.
 
-Imagine one million customers trying to buy a product with only 100 units in
-stock. The system must:
-
-- never oversell;
-- prevent one user from claiming the product twice;
-- return a fast response when stock is gone;
-- tolerate client retries without creating duplicate orders; and
-- continue processing accepted orders even if downstream services are slow.
-
-## Target architecture
+## Architecture
 
 ```text
-Client -> Load balancer -> Stateless API -> Redis atomic reservation
-                                           |
-                                           v
-                                      Order queue -> Worker -> Database
+Client -> FastAPI -> rate limit -> Redis Lua reservation
+                                  | stock + claim + replay record + stream event
+                                  v
+                            Redis Streams
+                                  |
+                       Worker consumer group
+                                  |
+                       PostgreSQL order commit
+                                  |
+                         Redis acknowledgment
+
+Client -> GET /orders/{reservation_id} -> PostgreSQL
+Prometheus -> GET /metrics -> API counters + Redis queue gauges
 ```
 
-Redis acts as the fast, atomic inventory gate. Only successful reservations
-are placed on the queue; workers persist them as orders asynchronously. This
-keeps the database out of the hot path during the traffic spike.
+The reservation path does not write to PostgreSQL. Lua serializes the inventory
+check, claim and enqueue operation on one Redis server. The worker commits an
+order before acknowledging its event. If it crashes between those steps,
+redelivery finds the same order via its reservation UUID and does not create
+another row. This is at-least-once processing with idempotent order writes,
+not exactly-once delivery.
 
-## Build milestones
+## Quick start with Docker
 
-1. Create a small API with a health endpoint and a sale/product model.
-2. Add atomic inventory reservation in Redis.
-3. Add one-purchase-per-user and idempotency protection.
-4. Add an asynchronous order worker and durable order storage.
-5. Add rate limiting, reservation expiry, metrics, and load tests.
+Requires Docker Engine/Desktop with Compose v2.
 
-## Core invariant
+```bash
+docker compose up -d --build --wait --wait-timeout 120
+curl --fail http://127.0.0.1:8000/ready
+```
 
-For a product, successful reservations must never exceed its configured stock.
+Compose starts the API, Redis, PostgreSQL and worker. The worker initializes the
+orders table. API readiness checks Redis, PostgreSQL and that table. The database
+credentials in Compose are local demo credentials.
 
-## Local services
+Reserve a product:
 
-- API service
-- Redis
-- PostgreSQL
-- Background order worker
+```bash
+curl -i -X POST http://127.0.0.1:8000/sales/limited-headphones/reservations \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: alice-purchase-1' \
+  -d '{"user_id":"alice"}'
+```
 
-The MVP API uses Python and FastAPI.
+Copy the returned reservation UUID into this request:
 
-## Run locally
+```bash
+curl http://127.0.0.1:8000/orders/REPLACE_WITH_RESERVATION_UUID
+curl http://127.0.0.1:8000/metrics
+docker compose logs --tail=50 worker
+```
 
-This MVP uses Python 3.11+ and FastAPI.
+Repeat the purchase with the same user and key to replay the original response.
+A different key for the same user/product returns a duplicate-claim conflict.
+The API documentation is at [localhost:8000/docs](http://localhost:8000/docs).
+
+| Endpoint / response | Meaning |
+| --- | --- |
+| `GET /health` | API process is alive |
+| `GET /ready` | Dependencies and order schema are ready; does not prove a worker is alive |
+| `GET /products/limited-headphones` | Current stock, initially 100 |
+| `POST /sales/{product_id}/reservations` → 201 | Reserved or replayed; not a paid order |
+| Reservation → 409 | Sold out or user already reserved with another key |
+| Reservation → 429 | Rate limited; observe `Retry-After` |
+| `GET /orders/{reservation_id}` → 200 | Saved order, status and creation time |
+| Order lookup → 404 | Unknown ID or worker has not saved it yet; retry after an accepted reservation |
+| 422 / 503 | Invalid input / required dependency unavailable |
+| `GET /metrics` | Prometheus text metrics |
+
+## Correctness and recovery
+
+- Stock and claims are shared across API instances; Redis Lua prevents
+  interleaving requests. Scripts do not roll back runtime errors, so the script
+  validates stock and queue type before writing.
+- Replay records last 24 hours and are scoped to product/user/key. Claims do not
+  expire. After replay expiry, the existing claim still prevents another purchase.
+- Reservation attempts for known products are limited to **10 per user ID per
+  60-second fixed window**, shared across API instances. Replays, duplicate claims
+  and sold-out attempts consume budget. Rejected attempts do not extend the
+  window or touch inventory. Retry with the same key after `Retry-After`.
+- Every worker loop reclaims up to 10 idle pending events, then reads new work.
+  `RECLAIM_IDLE_MS` defaults to 60000. Choose a value above normal batch time:
+  a slow live worker can overlap with recovery. PostgreSQL constraints make
+  duplicate order writes safe.
+- Permanently failing or malformed events remain pending and retry. Retry limits
+  and a dead-letter queue are future work.
+- Orders start as `pending_payment`. No payment provider or payment transition
+  endpoint is implemented. The schema supports future paid/cancelled statuses.
+
+## Persistence and shutdown
+
+Redis uses `redis.conf`: AOF enabled, fsync every second, and no eviction.
+Stock, claims, replay records, streams and pending consumer state survive a
+normal restart. Expiring keys still expire on schedule. Redis data lives in
+`redis_data`; orders live in `postgres_data`.
+
+```bash
+docker compose restart redis
+docker compose down
+```
+
+Normal shutdown retains both named volumes. Keep the same Compose project name
+to reuse them. **`docker compose down -v` deletes their data.** A pre-persistence
+container's data is not automatically migrated into the new volume.
+
+Every-second fsync can lose roughly one second of writes in an unplanned crash.
+Disk loss, Redis state loss and database/Redis reconciliation remain unresolved;
+this is not a zero-loss or high-availability design.
+
+## Tests
+
+For host development, use Python 3.11+:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
-docker compose up -d redis
-uvicorn app.main:app --reload
+python -m pytest -q
 ```
 
-In another terminal, verify the service:
-
-```bash
-curl http://127.0.0.1:8000/health
-curl http://127.0.0.1:8000/products/limited-headphones
-```
-
-Run tests from the repository with `.venv/bin/python -m pytest -q`. API tests
-use a fake gateway; inventory tests execute the production Lua script using
-fakeredis with Lua support. No running Redis is needed for these tests. These
-checks do not replace real Redis integration tests or performance benchmarks.
-Worker tests also exercise database and acknowledgment failures. Four PostgreSQL
-tests are skipped unless `TEST_DATABASE_URL` points to a disposable test database:
-
-```bash
-TEST_DATABASE_URL='postgresql://user:password@localhost/test_database' \
-  .venv/bin/python -m pytest -q
-```
-
-These tests create and remove randomly named schemas in that database. They
-verify concurrent duplicate delivery, conflicting orders, and commit-before-ack
-redelivery using real PostgreSQL and emulated Redis.
-
-For real Redis integration tests, provide a Redis 7.4+ executable (or put
-`redis-server` on PATH). The tests launch their own processes on private Unix
-sockets with temporary data directories, using the repository's `redis.conf`.
-They do not connect to or flush your development Redis. Requires macOS or Linux.
+Unit/API tests use fakeredis with Lua support. Real-service tests skip when
+their dependencies are not configured. On macOS/Linux, run all checks with a
+Redis 7.4+ executable and a disposable PostgreSQL database:
 
 ```bash
 TEST_REDIS_SERVER=/absolute/path/to/redis-server \
 TEST_DATABASE_URL='postgresql://user:password@localhost/test_database' \
-  .venv/bin/python -m pytest -q
+  python -m pytest -q
 ```
 
-Real-server tests check concurrent stock allocation, replay deduplication,
-shared rate limits, AOF reload, and worker recovery across a Redis restart with
-PostgreSQL order storage. An abrupt-exit test waits for disk sync with `WAITAOF`
-before killing its own Redis process; it does not assert zero loss for unsynced
-writes. Tests skip when their required executable/database is not configured.
-Verified locally: **36 passed with Redis 7.4.11 and PostgreSQL 18.3**. Compose uses
-PostgreSQL 17; container-level validation and load benchmarks are still pending.
+Redis tests start private processes on Unix sockets and temporary directories;
+they never flush development Redis. PostgreSQL tests create and remove isolated
+random schemas. Coverage includes concurrency, replay, worker failures, AOF
+restart, forced Redis exit after confirmed fsync, order lookup and metrics.
+The fsynced crash test does not promise durability for unsynced writes.
 
-## Current API
+**Verified locally: 40 tests passed with Redis 7.4.11 and PostgreSQL 18.3.**
+Docker/Compose startup has not been run locally because no container runtime is
+installed. The GitHub Actions workflow will build/start the Compose stack
+(PostgreSQL 17), wait for readiness, and run a 1,000-request smoke benchmark on
+push/PR. Its result is pending until that workflow executes.
 
-Reserve one item with a user identifier:
+For host-run services, set `REDIS_URL` and `DATABASE_URL`, then run
+`uvicorn app.main:app` and `python -m app.worker` in separate terminals.
+Use a unique `WORKER_NAME` per worker if overriding its generated name.
+
+## Load testing
+
+Use a fresh isolated sale, since the script deliberately never resets stock.
+Do not run it against a shared or production endpoint.
+
+Against a fresh running Compose stack:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/sales/limited-headphones/reservations \
-  -H "content-type: application/json" \
-  -H "Idempotency-Key: reserve-user-123-001" \
-  -d '{"user_id":"user-123"}'
+python -m scripts.load_test --requests 1000 --concurrency 50 \
+  --output benchmarks/my-run.json
 ```
 
-The endpoint returns `201` while stock remains and `409` when it is sold out.
-The stock counter lives in Redis and is decremented by a Lua script, so the
-check-and-decrement is atomic even when multiple API instances receive traffic.
-The same user can reserve a given product only once; duplicate attempts return
-`409` without decrementing stock.
-Send an `Idempotency-Key` on every request. Repeating the same request with the
-same key returns the original `201` response and does not reserve another unit.
-Replay records last 24 hours and are scoped to a product and user. After expiry,
-the user's permanent claim still blocks a second reservation.
-If Redis is unavailable, the API returns `503` instead of risking an
-incorrect sale.
-
-Look up the order using the `reservation_id` from the reservation response:
+Or let the local harness launch isolated Redis/API/worker processes and a
+temporary database schema:
 
 ```bash
-curl http://127.0.0.1:8000/orders/REPLACE_WITH_RESERVATION_UUID
+TEST_REDIS_SERVER=/absolute/path/to/redis-server \
+TEST_DATABASE_URL='postgresql://user:password@localhost/test_database' \
+  python -m scripts.benchmark_local --requests 5000 --concurrency 100 \
+  --output benchmarks/my-isolated-run.json
 ```
 
-`GET /orders/{reservation_id}` returns `200` with the reservation ID, product ID,
-user ID, status, and creation timestamp once the worker has saved the order.
-New orders have status `pending_payment`. A `404` means no order exists yet:
-the reservation may still be queued, or the ID may be unknown. After a successful
-reservation, wait briefly and retry; `404` alone does not prove sale failure.
-Malformed UUIDs return `422`; unavailable/unconfigured PostgreSQL returns `503`.
-On first startup, lookup may return `503` until the worker initializes the schema.
-This demo has no authentication; possession of a reservation UUID permits lookup.
+The harness consumes its own demo stock and removes only its temporary
+processes/schema. Choose a new report filename for each run. The load driver
+uses bounded concurrency, unique users and unique keys, measures HTTP response
+latency, polls all accepted orders, checks queue drain, and exits nonzero if
+correctness checks fail.
 
-## Reservation rate limit
+See [measured results and methodology](benchmarks/README.md). These are laptop
+baselines, not a capacity claim for a million concurrent buyers.
 
-Reservation requests for known products share a Redis-backed limit of **10
-attempts per user ID per 60 seconds**, across products and API instances. A
-fixed window begins with the first allowed attempt. Input validation and the
-product-existence check happen first; the rate limit runs before inventory access.
-Duplicate claims, sold-out attempts, and idempotent retries all consume budget.
-Requests above the limit receive `429` and a `Retry-After` header in seconds;
-rejections do not extend the window or change inventory/queued events.
+## Metrics
 
-If throttled while retrying a reservation, wait as directed and reuse the same
-idempotency key. A rate-limit store failure returns `503` and does not proceed
-to the reservation. Read endpoints are not throttled in this milestone.
+`GET /metrics` exposes request counts/latency, reservation outcomes, and queue
+lag/pending gauges. Route labels use templates, not user IDs or UUIDs.
+Counters are per API process; scrape each instance. Queue gauges represent
+shared state and must not be summed across instances. They are omitted on
+Redis failure instead of falsely reporting zero backlog.
 
-The demo trusts the supplied user ID: changing it bypasses this per-user limit.
-Authentication, trusted-proxy/IP limits, and edge traffic protection are still
-needed for a public service. A fixed window also permits bursts around its
-boundary; this is not a global throughput or DDoS limit.
+See [metric definitions and PromQL queries](docs/metrics.md). The root
+`prometheus.yml` is an optional scrape config; no Prometheus server is started
+automatically.
 
-## Reservation queue
+## Scope and remaining limitations
 
-Successful new reservations append a `reservation.created` event to the Redis
-Stream `flash-sale:reservations` in the same Lua script as the stock decrement
-and claim. Retries and rejected attempts do not add events. Each event contains
-`schema_version`, `reservation_id`, `product_id`, and `user_id`.
+This single-product, single-sale demo trusts caller-supplied user IDs and does
+not authenticate order lookups. Changing user IDs bypasses per-user throttling;
+the limiter is not an edge/DDoS protection layer. Fixed windows permit boundary
+bursts, and reads are not rate limited.
 
-Inspect queued events after making a reservation:
+Other future work: reservation expiry/compensation, payment simulation,
+dead-letter handling, schema migrations, connection pooling, Redis Cluster key
+layout, replication/backups, inventory reconciliation, authenticated identity,
+dependency refresh, and multi-host load testing. A million requests over time
+and a million simultaneous requests are different workloads; neither capacity
+has been demonstrated here.
 
-```bash
-docker compose exec redis redis-cli XRANGE flash-sale:reservations - + COUNT 10
-```
-
-The worker reads events through the `order-workers` consumer group, including
-events queued before its first startup. It saves an order in PostgreSQL with
-status `pending_payment`, then acknowledges the event. The reservation UUID is
-the order's primary key: repeated delivery reuses the existing row, without
-resetting its status or creation time. Conflicting payloads are rejected.
-PostgreSQL also enforces one order per product/user for this single-sale demo.
-
-A `201` API response confirms a reservation; order creation happens later. It
-does not indicate payment. The stream is intentionally untrimmed until we
-implement safe retention after processing.
-
-Failures are logged and left pending. Each worker loop first reclaims up to
-10 events idle for at least 60 seconds using `XAUTOCLAIM`, then reads new work.
-This recovers its own failed events and events owned by crashed workers. The
-pending-list scan cursor advances across loops so later entries are reached.
-Reclaiming resets the idle timer, spacing retries by at least the idle threshold.
-
-Configure `RECLAIM_IDLE_MS` on the worker to change the positive threshold in
-milliseconds. Choose a value longer than normal batch processing time: a slow
-live worker can otherwise overlap with a recovering worker. PostgreSQL's unique
-constraints make repeated order writes safe. Delivery can occur more than once;
-this does not promise exactly-once message delivery.
-
-Malformed or permanently failing events stay pending and retry at that interval;
-a retry limit and dead-letter queue are still future work. Missing stream entries
-are logged as errors because recovery cannot reconstruct deleted event data.
-
-The prototype targets a single Redis server and trusts caller-supplied user IDs.
-It has no authentication. AOF persistence is enabled as described below; losing
-the Redis data volume can still lose claims/events and cause stock to be reseeded. Lua prevents
-interleaving requests but does not provide rollback for runtime errors; the
-script validates stock and queue type before writing. See
-[Redis scripting documentation](https://redis.io/docs/latest/develop/programmability/eval-intro/).
-
-## Run with Docker
-
-Docker Compose starts the API, Redis, PostgreSQL, and the worker. The API uses
-Redis for stock, claims, replay responses, and queued reservation events. The
-worker writes orders, and the API reads them for status lookups; reservation
-requests do not access PostgreSQL.
-The bundled database credentials are for local development. PostgreSQL has no
-published host port, and its data lives in the named `postgres_data` volume.
-
-```bash
-docker compose up --build
-```
-
-Send the reservation request above, then inspect worker logs and saved orders:
-
-```bash
-docker compose logs --tail=50 worker
-docker compose exec postgres psql -U flashsale -d flashsale -c \
-  "SELECT reservation_id, product_id, user_id, status, created_at FROM orders;"
-docker compose exec redis redis-cli XPENDING flash-sale:reservations order-workers
-```
-
-The worker bootstraps the initial table from `app/orders.sql`. This is an initial
-schema, not a migration framework. To run a worker outside Docker, configure
-`DATABASE_URL` and `REDIS_URL` and run `python -m app.worker`. Each process gets
-a unique consumer name unless `WORKER_NAME` is set (use a unique value per worker).
-The implementation uses a short database transaction and connection per event;
-connection pooling and batching can be measured and added later.
-
-Stop the services with:
-
-```bash
-docker compose down
-```
-
-This retains both the `postgres_data` and `redis_data` named volumes. Keep the
-same Compose project name to reuse them. `docker compose down -v` removes these
-volumes and their data; do not use it for normal shutdown.
-
-## Redis persistence
-
-`redis.conf` enables append-only persistence with `appendfsync everysec`, stored
-in `/data` on the `redis_data` volume. Stock, user claims, idempotency responses,
-rate limits, stream events, and consumer-group pending state survive a normal
-restart. Keys with expiry still expire on schedule. `noeviction` prevents
-inventory keys from being silently evicted if a memory limit is introduced.
-
-Test a normal restart after making a reservation:
-
-```bash
-docker compose restart redis
-curl http://127.0.0.1:8000/products/limited-headphones
-```
-
-Stock should remain reduced, and retrying the original reservation with the same
-key should replay its response (subject to the rate limit). Requests during the
-restart may receive `503`. AOF's every-second sync can lose roughly one second
-of writes on an unplanned crash; this is not a zero-loss or high-availability
-design. Replication, backups, and database reconciliation remain future work.
-See [Redis persistence tradeoffs](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/).
-
-If upgrading an already-running pre-persistence demo, existing data in its old
-container is **not automatically migrated** to the new named volume. Preserve
-that data before recreating Redis if it matters; this configuration is for new
-demo runs and subsequent persistent restarts.
-
-Implementation references: [Redis consumer groups](https://redis.io/docs/latest/commands/xreadgroup/)
-[pending-event recovery](https://redis.io/docs/latest/commands/xautoclaim/),
-and [Psycopg transactions](https://www.psycopg.org/psycopg3/docs/basic/usage.html).
+References: [Redis Lua](https://redis.io/docs/latest/develop/programmability/eval-intro/),
+[consumer recovery](https://redis.io/docs/latest/commands/xautoclaim/),
+[persistence tradeoffs](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/),
+[Psycopg transactions](https://www.psycopg.org/psycopg3/docs/basic/usage.html).

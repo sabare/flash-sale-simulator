@@ -1,0 +1,35 @@
+name: Tests and Docker smoke test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      COMPOSE_PROJECT_NAME: flash-sale-ci-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      # Explicitly exclude opt-in native-service tests; Docker covers the real stack below.
+      - run: python -m pytest -q --ignore=tests/test_redis_integration.py --ignore=tests/test_orders_postgres.py
+      - run: docker compose config --quiet
+      - run: docker compose up -d --build --wait --wait-timeout 120
+      - run: python -m scripts.load_test --requests 1000 --concurrency 50 --output benchmark-ci.json
+      - run: curl --fail http://127.0.0.1:8000/metrics
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-ci
+          path: benchmark-ci.json
+          if-no-files-found: ignore
+      - name: Service logs
+        if: always()
+        run: docker compose logs --no-color --tail=100
+      - name: Clean up this job's isolated stack
+        if: always()
+        run: docker compose down -v

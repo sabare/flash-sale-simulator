@@ -1,7 +1,10 @@
 import os
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
+import psycopg
+from redis.exceptions import RedisError
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
 from app.inventory import (
@@ -9,9 +12,11 @@ from app.inventory import (
     InventoryUnavailableError,
     ReservationOutcome,
     get_inventory_gateway,
+    get_redis_client,
 )
 from app.orders import Order, OrderStoreUnavailableError, PostgresOrderStore
 from app.rate_limit import RateLimitUnavailableError, RedisRateLimiter, get_rate_limiter
+from app.metrics import MetricsMiddleware, REGISTRY, RESERVATIONS
 
 
 app = FastAPI(
@@ -19,6 +24,7 @@ app = FastAPI(
     version="0.1.0",
     description="A backend simulation of limited-inventory flash sales.",
 )
+app.add_middleware(MetricsMiddleware)
 
 
 class Product(BaseModel):
@@ -54,6 +60,27 @@ INITIAL_STOCK = {product_id: product.available_stock for product_id, product in 
 def health_check() -> dict[str, str]:
     """Return service status for load balancers and local checks."""
     return {"status": "ok"}
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics() -> Response:
+    return Response(generate_latest(REGISTRY), headers={"Content-Type": CONTENT_TYPE_LATEST})
+
+
+@app.get("/ready")
+def readiness() -> dict[str, str]:
+    try:
+        get_redis_client().ping()
+        database_url = os.getenv("DATABASE_URL")
+        if not database_url:
+            raise ValueError("DATABASE_URL missing")
+        with psycopg.connect(database_url, connect_timeout=2) as connection:
+            connection.execute("SET LOCAL statement_timeout = '2s'")
+            if connection.execute("SELECT to_regclass('orders')").fetchone()[0] is None:
+                raise ValueError("Order schema not initialized")
+    except (RedisError, psycopg.Error, ValueError):
+        raise HTTPException(status_code=503, detail="Dependencies not ready")
+    return {"status": "ready"}
 
 
 def get_order_store() -> PostgresOrderStore:
@@ -116,8 +143,10 @@ def reserve_product(
     try:
         retry_after = rate_limiter.check(request.user_id)
     except RateLimitUnavailableError:
+        RESERVATIONS.labels("rate_limit_unavailable").inc()
         raise HTTPException(status_code=503, detail="Rate limit service unavailable")
     if retry_after:
+        RESERVATIONS.labels("rate_limited").inc()
         raise HTTPException(
             status_code=429, detail="Too many reservation attempts",
             headers={"Retry-After": str(retry_after)},
@@ -132,8 +161,10 @@ def reserve_product(
             str(uuid4()),
         )
     except InventoryUnavailableError:
+        RESERVATIONS.labels("inventory_unavailable").inc()
         raise HTTPException(status_code=503, detail="Inventory service unavailable")
 
+    RESERVATIONS.labels(reservation_result.outcome.value).inc()
     if reservation_result.outcome is ReservationOutcome.SOLD_OUT:
         raise HTTPException(status_code=409, detail="Product is sold out")
     if reservation_result.outcome is ReservationOutcome.ALREADY_RESERVED:

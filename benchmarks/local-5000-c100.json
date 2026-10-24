@@ -1,0 +1,58 @@
+{
+  "timestamp_utc": "2026-10-24T05:14:32.675449+00:00",
+  "run_id": "9e132e107fa24068bdfc6e32a2ac59be",
+  "python": "3.14.3",
+  "platform": "macOS-26.3-x86_64-i386-64bit-Mach-O",
+  "workload": {
+    "requests": 5000,
+    "concurrency": 100,
+    "initial_stock": 100,
+    "pattern": "closed-loop, unique user and idempotency key per request"
+  },
+  "duration_seconds": 24.833,
+  "requests_per_second": 201.34,
+  "outcomes": {
+    "201": 100,
+    "409_sold_out": 4900
+  },
+  "latency_ms": {
+    "p50": 335.864,
+    "p95": 1447.028,
+    "p99": 2394.385
+  },
+  "accepted_latency_ms": {
+    "p50": 126.136,
+    "p95": 571.176
+  },
+  "sold_out_latency_ms": {
+    "p50": 340.7,
+    "p95": 1465.491
+  },
+  "persisted_orders": 100,
+  "order_poll_seconds": 0.409,
+  "queue": {
+    "flash_sale_queue_redis_up": 1.0,
+    "flash_sale_queue_group_exists": 1.0,
+    "flash_sale_queue_events": 100.0,
+    "flash_sale_queue_pending": 0.0,
+    "flash_sale_queue_lag": 0.0
+  },
+  "checks": {
+    "exactly_stock_accepted": true,
+    "only_expected_responses": true,
+    "unique_reservations": true,
+    "stock_is_zero": true,
+    "all_orders_persisted": true,
+    "queue_drained": true,
+    "queue_scrape_healthy": true,
+    "database_row_count_matches_stock": true
+  },
+  "passed": true,
+  "services": {
+    "redis": "7.4.11",
+    "postgres": "18.3 (Homebrew)",
+    "api_processes": 1,
+    "worker_processes": 1,
+    "placement": "load generator and all services on one host"
+  }
+}
