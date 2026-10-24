@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from app.inventory import (
     InventoryGateway,
     InventoryUnavailableError,
+    ReservationOutcome,
     get_inventory_gateway,
 )
 
@@ -84,16 +85,20 @@ def reserve_product(
         raise HTTPException(status_code=404, detail="Product not found")
 
     try:
-        remaining_stock = inventory.reserve(product_id, INITIAL_STOCK[product_id])
+        reservation_result = inventory.reserve(
+            product_id, INITIAL_STOCK[product_id], request.user_id
+        )
     except InventoryUnavailableError:
         raise HTTPException(status_code=503, detail="Inventory service unavailable")
 
-    if remaining_stock is None:
+    if reservation_result is ReservationOutcome.SOLD_OUT:
         raise HTTPException(status_code=409, detail="Product is sold out")
+    if reservation_result is ReservationOutcome.ALREADY_RESERVED:
+        raise HTTPException(status_code=409, detail="User has already reserved this product")
 
     return Reservation(
         reservation_id=str(uuid4()),
         product_id=product_id,
         user_id=request.user_id,
-        remaining_stock=remaining_stock,
+        remaining_stock=reservation_result,
     )

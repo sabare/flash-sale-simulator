@@ -3,7 +3,7 @@ from collections.abc import Iterator
 import pytest
 from fastapi.testclient import TestClient
 
-from app.inventory import get_inventory_gateway
+from app.inventory import ReservationOutcome, get_inventory_gateway
 from app.main import INITIAL_STOCK, app
 
 
@@ -13,16 +13,24 @@ client = TestClient(app)
 class FakeInventoryGateway:
     def __init__(self, stock: dict[str, int]) -> None:
         self.stock = stock.copy()
+        self.claims: set[tuple[str, str]] = set()
 
     def available_stock(self, product_id: str, initial_stock: int) -> int:
         return self.stock.setdefault(product_id, initial_stock)
 
-    def reserve(self, product_id: str, initial_stock: int) -> int | None:
+    def reserve(
+        self, product_id: str, initial_stock: int, user_id: str
+    ) -> int | ReservationOutcome:
+        claim = (product_id, user_id)
+        if claim in self.claims:
+            return ReservationOutcome.ALREADY_RESERVED
+
         available_stock = self.available_stock(product_id, initial_stock)
         if available_stock == 0:
-            return None
+            return ReservationOutcome.SOLD_OUT
         available_stock -= 1
         self.stock[product_id] = available_stock
+        self.claims.add(claim)
         return available_stock
 
 
@@ -78,3 +86,19 @@ def test_reservation_returns_conflict_when_product_is_sold_out(
 
     assert response.status_code == 409
     assert response.json() == {"detail": "Product is sold out"}
+
+
+def test_user_cannot_reserve_the_same_product_twice() -> None:
+    first_response = client.post(
+        "/sales/limited-headphones/reservations", json={"user_id": "user-123"}
+    )
+    second_response = client.post(
+        "/sales/limited-headphones/reservations", json={"user_id": "user-123"}
+    )
+
+    assert first_response.status_code == 201
+    assert second_response.status_code == 409
+    assert second_response.json() == {
+        "detail": "User has already reserved this product"
+    }
+    assert client.get("/products/limited-headphones").json()["available_stock"] == 99

@@ -81,6 +81,8 @@ curl -X POST http://127.0.0.1:8000/sales/limited-headphones/reservations \
 The endpoint returns `201` while stock remains and `409` when it is sold out.
 The stock counter lives in Redis and is decremented by a Lua script, so the
 check-and-decrement is atomic even when multiple API instances receive traffic.
+The same user can reserve a given product only once; duplicate attempts return
+`409` without decrementing stock.
 If Redis is unavailable, the API returns `503` instead of risking an
 incorrect sale.
 
