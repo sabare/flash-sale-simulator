@@ -47,7 +47,7 @@ For a product, successful reservations must never exceed its configured stock.
 - PostgreSQL
 - Background order worker
 
-The exact application framework will be selected before milestone 1.
+The MVP API uses Python and FastAPI.
 
 ## Run the first milestone
 
@@ -67,6 +67,21 @@ curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/products/limited-headphones
 pytest
 ```
+
+## Current API
+
+Reserve one item with a user identifier:
+
+```bash
+curl -X POST http://127.0.0.1:8000/sales/limited-headphones/reservations \
+  -H "content-type: application/json" \
+  -d '{"user_id":"user-123"}'
+```
+
+The endpoint returns `201` while stock remains and `409` when it is sold out.
+It currently uses a process-local lock only. The next milestone moves the
+atomic stock check and decrement to Redis, which is safe when API instances
+scale horizontally.
 
 ## Run with Docker
 
