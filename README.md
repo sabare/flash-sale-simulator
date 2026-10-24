@@ -75,6 +75,7 @@ Reserve one item with a user identifier:
 ```bash
 curl -X POST http://127.0.0.1:8000/sales/limited-headphones/reservations \
   -H "content-type: application/json" \
+  -H "Idempotency-Key: reserve-user-123-001" \
   -d '{"user_id":"user-123"}'
 ```
 
@@ -83,6 +84,8 @@ The stock counter lives in Redis and is decremented by a Lua script, so the
 check-and-decrement is atomic even when multiple API instances receive traffic.
 The same user can reserve a given product only once; duplicate attempts return
 `409` without decrementing stock.
+Send an `Idempotency-Key` on every request. Repeating the same request with the
+same key returns the original `201` response and does not reserve another unit.
 If Redis is unavailable, the API returns `503` instead of risking an
 incorrect sale.
 

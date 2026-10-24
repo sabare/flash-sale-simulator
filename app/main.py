@@ -1,6 +1,6 @@
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.inventory import (
@@ -78,6 +78,9 @@ def get_product(
 def reserve_product(
     product_id: str,
     request: ReservationRequest,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=255
+    ),
     inventory: InventoryGateway = Depends(get_inventory_gateway),
 ) -> Reservation:
     """Reserve one product unit with Redis as the shared atomic stock gate."""
@@ -86,19 +89,23 @@ def reserve_product(
 
     try:
         reservation_result = inventory.reserve(
-            product_id, INITIAL_STOCK[product_id], request.user_id
+            product_id,
+            INITIAL_STOCK[product_id],
+            request.user_id,
+            idempotency_key,
+            str(uuid4()),
         )
     except InventoryUnavailableError:
         raise HTTPException(status_code=503, detail="Inventory service unavailable")
 
-    if reservation_result is ReservationOutcome.SOLD_OUT:
+    if reservation_result.outcome is ReservationOutcome.SOLD_OUT:
         raise HTTPException(status_code=409, detail="Product is sold out")
-    if reservation_result is ReservationOutcome.ALREADY_RESERVED:
+    if reservation_result.outcome is ReservationOutcome.ALREADY_RESERVED:
         raise HTTPException(status_code=409, detail="User has already reserved this product")
 
     return Reservation(
-        reservation_id=str(uuid4()),
+        reservation_id=reservation_result.reservation_id,
         product_id=product_id,
         user_id=request.user_id,
-        remaining_stock=reservation_result,
+        remaining_stock=reservation_result.remaining_stock,
     )

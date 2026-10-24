@@ -1,6 +1,8 @@
 """Inventory gateways for the flash-sale reservation flow."""
 
+import json
 import os
+from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from typing import Protocol
@@ -9,23 +11,35 @@ from redis import Redis
 from redis.exceptions import RedisError
 
 
-# The script checks a per-user claim and decrements stock in one Redis
-# operation. Any non-negative result is the remaining stock after reservation.
+# The script checks the idempotency record, prevents duplicate user claims, and
+# decrements stock in one Redis operation. Codes 0 and 1 include a JSON payload
+# with the original reservation id and remaining stock.
 RESERVE_STOCK_SCRIPT = """
+local existing_reservation = redis.call('GET', KEYS[3])
+if existing_reservation then
+    return {1, existing_reservation}
+end
 if redis.call('EXISTS', KEYS[2]) == 1 then
-    return -3
+    return {-3, ''}
 end
 local stock = redis.call('GET', KEYS[1])
 if not stock then
-    return -2
+    return {-2, ''}
 end
 if tonumber(stock) <= 0 then
-    return -1
+    return {-1, ''}
 end
 local remaining_stock = redis.call('DECR', KEYS[1])
 redis.call('SET', KEYS[2], 'claimed')
-return remaining_stock
+local reservation = cjson.encode({
+    reservation_id = ARGV[1],
+    remaining_stock = remaining_stock
+})
+redis.call('SET', KEYS[3], reservation, 'EX', ARGV[2])
+return {0, reservation}
 """
+
+IDEMPOTENCY_TTL_SECONDS = 86_400
 
 
 class InventoryUnavailableError(Exception):
@@ -33,16 +47,30 @@ class InventoryUnavailableError(Exception):
 
 
 class ReservationOutcome(str, Enum):
+    RESERVED = "reserved"
+    IDEMPOTENT_REPLAY = "idempotent_replay"
     SOLD_OUT = "sold_out"
     ALREADY_RESERVED = "already_reserved"
+
+
+@dataclass(frozen=True)
+class ReservationResult:
+    outcome: ReservationOutcome
+    reservation_id: str | None = None
+    remaining_stock: int | None = None
 
 
 class InventoryGateway(Protocol):
     def available_stock(self, product_id: str, initial_stock: int) -> int: ...
 
     def reserve(
-        self, product_id: str, initial_stock: int, user_id: str
-    ) -> int | ReservationOutcome: ...
+        self,
+        product_id: str,
+        initial_stock: int,
+        user_id: str,
+        idempotency_key: str,
+        reservation_id: str,
+    ) -> ReservationResult: ...
 
 
 class RedisInventoryGateway:
@@ -58,6 +86,13 @@ class RedisInventoryGateway:
     @staticmethod
     def _claim_key(product_id: str, user_id: str) -> str:
         return f"flash-sale:product:{product_id}:claim:{user_id}"
+
+    @staticmethod
+    def _idempotency_key(product_id: str, user_id: str, idempotency_key: str) -> str:
+        return (
+            f"flash-sale:product:{product_id}:user:{user_id}:"
+            f"idempotency:{idempotency_key}"
+        )
 
     def _ensure_stock_counter(self, product_id: str, initial_stock: int) -> str:
         key = self._stock_key(product_id)
@@ -80,24 +115,52 @@ class RedisInventoryGateway:
         return int(value)
 
     def reserve(
-        self, product_id: str, initial_stock: int, user_id: str
-    ) -> int | ReservationOutcome:
+        self,
+        product_id: str,
+        initial_stock: int,
+        user_id: str,
+        idempotency_key: str,
+        reservation_id: str,
+    ) -> ReservationResult:
         stock_key = self._ensure_stock_counter(product_id, initial_stock)
         claim_key = self._claim_key(product_id, user_id)
+        idempotency_record_key = self._idempotency_key(
+            product_id, user_id, idempotency_key
+        )
         try:
-            remaining_stock = int(
-                self.client.eval(RESERVE_STOCK_SCRIPT, 2, stock_key, claim_key)
+            result_code, reservation_json = self.client.eval(
+                RESERVE_STOCK_SCRIPT,
+                3,
+                stock_key,
+                claim_key,
+                idempotency_record_key,
+                reservation_id,
+                IDEMPOTENCY_TTL_SECONDS,
             )
         except RedisError as error:
             raise InventoryUnavailableError from error
 
-        if remaining_stock == -1:
-            return ReservationOutcome.SOLD_OUT
-        if remaining_stock == -2:
+        result_code = int(result_code)
+        if result_code == -1:
+            return ReservationResult(ReservationOutcome.SOLD_OUT)
+        if result_code == -2:
             raise InventoryUnavailableError
-        if remaining_stock == -3:
-            return ReservationOutcome.ALREADY_RESERVED
-        return remaining_stock
+        if result_code == -3:
+            return ReservationResult(ReservationOutcome.ALREADY_RESERVED)
+        if result_code not in {0, 1}:
+            raise InventoryUnavailableError
+
+        payload = json.loads(reservation_json)
+        outcome = (
+            ReservationOutcome.RESERVED
+            if result_code == 0
+            else ReservationOutcome.IDEMPOTENT_REPLAY
+        )
+        return ReservationResult(
+            outcome=outcome,
+            reservation_id=payload["reservation_id"],
+            remaining_stock=payload["remaining_stock"],
+        )
 
 
 @lru_cache
