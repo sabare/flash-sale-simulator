@@ -9,6 +9,32 @@ services:
       redis:
         condition: service_healthy
 
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://flashsale:flashsale_dev@postgres:5432/flashsale
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: flashsale
+      POSTGRES_PASSWORD: flashsale_dev
+      POSTGRES_DB: flashsale
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flashsale -d flashsale"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   redis:
     image: redis:7.4-alpine
     ports:
@@ -18,3 +44,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+volumes:
+  postgres_data:

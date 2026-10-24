@@ -40,7 +40,7 @@ keeps the database out of the hot path during the traffic spike.
 
 For a product, successful reservations must never exceed its configured stock.
 
-## Local services (planned)
+## Local services
 
 - API service
 - Redis
@@ -72,6 +72,17 @@ Run tests from the repository with `.venv/bin/python -m pytest -q`. API tests
 use a fake gateway; inventory tests execute the production Lua script using
 fakeredis with Lua support. No running Redis is needed for these tests. These
 checks do not replace real Redis integration tests or performance benchmarks.
+Worker tests also exercise database and acknowledgment failures. Three PostgreSQL
+tests are skipped unless `TEST_DATABASE_URL` points to a disposable test database:
+
+```bash
+TEST_DATABASE_URL='postgresql://user:password@localhost/test_database' \
+  .venv/bin/python -m pytest -q
+```
+
+These tests create and remove randomly named schemas in that database. They
+verify concurrent duplicate delivery, conflicting orders, and commit-before-ack
+redelivery using real PostgreSQL and emulated Redis.
 
 ## Current API
 
@@ -109,10 +120,21 @@ Inspect queued events after making a reservation:
 docker compose exec redis redis-cli XRANGE flash-sale:reservations - + COUNT 10
 ```
 
-This milestone implements the producer only. Events wait in the stream; a
-consumer-group worker and durable order database are the next steps. A `201`
-response confirms a reservation, not a completed order or payment. The stream
-is intentionally untrimmed until we implement safe retention after processing.
+The worker reads events through the `order-workers` consumer group, including
+events queued before its first startup. It saves an order in PostgreSQL with
+status `pending_payment`, then acknowledges the event. The reservation UUID is
+the order's primary key: repeated delivery reuses the existing row, without
+resetting its status or creation time. Conflicting payloads are rejected.
+PostgreSQL also enforces one order per product/user for this single-sale demo.
+
+A `201` API response confirms a reservation; order creation happens later. It
+does not indicate payment. The stream is intentionally untrimmed until we
+implement safe retention after processing.
+
+Failures are logged and left pending. **Automatic pending-event recovery is
+the next milestone:** this worker currently reads only new deliveries, so
+restarting it does not retry pending events. Malformed events also remain pending
+for inspection; retry policies and a dead-letter queue are not implemented yet.
 
 The prototype targets a single Redis server and trusts caller-supplied user IDs.
 It has no authentication or crash-durability guarantee yet. Losing Redis state
@@ -123,15 +145,40 @@ script validates stock and queue type before writing. See
 
 ## Run with Docker
 
-Docker Compose starts the API and Redis together. The API uses the shared Redis
-server for stock, claims, replay responses, and queued reservation events.
+Docker Compose starts the API, Redis, PostgreSQL, and the worker. The API uses
+Redis for stock, claims, replay responses, and queued reservation events. Only
+the worker connects to PostgreSQL; database writes stay outside the request path.
+The bundled database credentials are for local development. PostgreSQL has no
+published host port, and its data lives in the named `postgres_data` volume.
 
 ```bash
 docker compose up --build
 ```
+
+Send the reservation request above, then inspect worker logs and saved orders:
+
+```bash
+docker compose logs --tail=50 worker
+docker compose exec postgres psql -U flashsale -d flashsale -c \
+  "SELECT reservation_id, product_id, user_id, status, created_at FROM orders;"
+docker compose exec redis redis-cli XPENDING flash-sale:reservations order-workers
+```
+
+The worker bootstraps the initial table from `app/orders.sql`. This is an initial
+schema, not a migration framework. To run a worker outside Docker, configure
+`DATABASE_URL` and `REDIS_URL` and run `python -m app.worker`. Each process gets
+a unique consumer name unless `WORKER_NAME` is set (use a unique value per worker).
+The implementation uses a short database transaction and connection per event;
+connection pooling and batching can be measured and added later.
 
 Stop the services with:
 
 ```bash
 docker compose down
 ```
+
+This retains PostgreSQL's named volume. Redis persistence is not configured yet;
+recreating Redis can reset the sale while old orders remain in PostgreSQL.
+
+Implementation references: [Redis consumer groups](https://redis.io/docs/latest/commands/xreadgroup/)
+and [Psycopg transactions](https://www.psycopg.org/psycopg3/docs/basic/usage.html).
